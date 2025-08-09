@@ -13,6 +13,8 @@ set(SOURCES
 	src/main.c
 	src/json.c
 	src/mqtt.c
+    src/config.c
+    src/modbus.c
 )
 
 add_executable(modbus_client_BB ${SOURCES})
@@ -21,7 +23,7 @@ target_link_libraries(modbus_client_BB
 	cJSON         
     #    libmodbus     
 	paho-mqtt3a
-        pthread	
+    pthread	
 )
 
 set(CMAKE_EXE_LINKER_FLAGS "-static")

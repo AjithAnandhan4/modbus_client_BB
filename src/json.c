@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <errno.h>
 #include "json.h"
 
 void parse_and_print_json(const char *json_string) {
@@ -35,5 +37,34 @@ void parse_and_print_json(const char *json_string) {
     }
 
     cJSON_Delete(root);
+}
+
+bool json_save_to_file(const char *path, const char *json_text) {
+    if (path == NULL || json_text == NULL) { return false; }
+    FILE *fp = fopen(path, "wb");
+    if (fp == NULL) { return false; }
+    const size_t len = strlen(json_text);
+    size_t written = fwrite(json_text, 1, len, fp);
+    int rc = fclose(fp);
+    return (written == len) && (rc == 0);
+}
+
+bool json_load_file(const char *path, char **out_text) {
+    if (path == NULL || out_text == NULL) { return false; }
+    *out_text = NULL;
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) { return false; }
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return false; }
+    long sz = ftell(fp);
+    if (sz < 0 || sz > 1024L * 1024L) { fclose(fp); return false; }
+    if (fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return false; }
+    char *buf = (char*)malloc((size_t)sz + 1U);
+    if (buf == NULL) { fclose(fp); return false; }
+    size_t rd = fread(buf, 1, (size_t)sz, fp);
+    fclose(fp);
+    if (rd != (size_t)sz) { free(buf); return false; }
+    buf[sz] = '\0';
+    *out_text = buf;
+    return true;
 }
 

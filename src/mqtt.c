@@ -5,15 +5,30 @@
 #include <pthread.h>
 #include <unistd.h>   // for sleep()
 #include "mqtt.h"
+#include "config.h"
+#include "modbus.h"
+#include "json.h"
 
 #define MQTT_ADDRESS     "tcp://test.mosquitto.org:1883"
 #define MQTT_CLIENTID    "modbus_client_BB"
 #define MQTT_TOPIC       "modbus/test"
+#define MQTT_CONFIG_TOPIC "modbus/config"
 #define MQTT_QOS         1
 #define MQTT_TIMEOUT     10000L
 
 static MQTTAsync client;
+static char g_mqtt_uri[256] = MQTT_ADDRESS;
+static char g_mqtt_clientid[128] = MQTT_CLIENTID;
 static volatile int client_ready = 0;  // flag to mark connection status
+
+static void publish_adapter(const char *topic, const char *payload) {
+    mqtt_publish(topic, payload);
+}
+
+// Forward declarations for callbacks referenced before definition
+void onDeliveryComplete(void *context, MQTTAsync_token token);
+void onConnectSuccess(void *context, MQTTAsync_successData *response);
+void onConnectFailure(void *context, MQTTAsync_failureData *response);
 
 // Connection lost callback
 void connlost(void *context, char *cause) {
@@ -40,6 +55,50 @@ int msgarrvd(void *context, char *topicName, int topicLen, MQTTAsync_message *me
     printf("Message arrived on topic: %s\n", topicName);
     printf("Payload: %.*s\n", message->payloadlen, (char *)message->payload);
 
+    if (strcmp(topicName, MQTT_CONFIG_TOPIC) == 0) {
+        // Parse config and (re)start worker
+        ModbusConfig cfg;
+        MqttClientSettings mset;
+        char *tmp = (char*)malloc((size_t)message->payloadlen + 1);
+        if (tmp) {
+            memcpy(tmp, message->payload, (size_t)message->payloadlen);
+            tmp[message->payloadlen] = '\0';
+            // Persist raw JSON to disk for reset-proof behavior
+            (void)json_save_to_file("/tmp/modbus_config.json", tmp);
+            // Update MQTT settings if provided
+            if (config_mqtt_settings_from_json(tmp, &mset)) {
+                if (mset.host[0] && mset.port > 0) {
+                    snprintf(g_mqtt_uri, sizeof(g_mqtt_uri), "tcp://%s:%d", mset.host, mset.port);
+                }
+                if (mset.client_id[0]) {
+                    snprintf(g_mqtt_clientid, sizeof(g_mqtt_clientid), "%s", mset.client_id);
+                }
+                // Recreate client with new settings
+                MQTTAsync_destroy(&client);
+                if (MQTTAsync_create(&client, g_mqtt_uri, g_mqtt_clientid, MQTTCLIENT_PERSISTENCE_NONE, NULL) == MQTTASYNC_SUCCESS) {
+                    MQTTAsync_setCallbacks(client, NULL, connlost, msgarrvd, onDeliveryComplete);
+                    MQTTAsync_connectOptions conn_opts = MQTTAsync_connectOptions_initializer;
+                    conn_opts.keepAliveInterval = 20;
+                    conn_opts.cleansession = 1;
+                    conn_opts.onSuccess = onConnectSuccess;
+                    conn_opts.onFailure = onConnectFailure;
+                    conn_opts.context = client;
+                    MQTTAsync_connect(client, &conn_opts);
+                    printf("MQTT settings updated. Reconnecting to %s with clientId %s.\n", g_mqtt_uri, g_mqtt_clientid);
+                }
+            }
+            if (config_update_from_json(tmp, &cfg)) {
+                if (modbus_worker_is_running()) modbus_worker_stop();
+                if (!cfg.publish_topic[0]) snprintf(cfg.publish_topic, sizeof(cfg.publish_topic), "%s", MQTT_TOPIC);
+                modbus_worker_start(&cfg, publish_adapter);
+                printf("Config applied and worker started.\n");
+            } else {
+                printf("Invalid config JSON.\n");
+            }
+            free(tmp);
+        }
+    }
+
     MQTTAsync_freeMessage(&message);
     MQTTAsync_free(topicName);
     return 1;
@@ -60,6 +119,12 @@ void onConnectSuccess(void *context, MQTTAsync_successData *response) {
     if (rc != MQTTASYNC_SUCCESS) {
         printf("Failed to subscribe, return code %d\n", rc);
     }
+
+    // Subscribe to config topic
+    rc = MQTTAsync_subscribe(client, MQTT_CONFIG_TOPIC, MQTT_QOS, NULL);
+    if (rc != MQTTASYNC_SUCCESS) {
+        printf("Failed to subscribe to config, return code %d\n", rc);
+    }
 }
 
 // Connection failure callback
@@ -73,7 +138,22 @@ void *mqtt_thread_func(void *arg) {
 
     printf("Thread started\n");
 
-    rc = MQTTAsync_create(&client, MQTT_ADDRESS, MQTT_CLIENTID,
+    // Try to load persisted config to override defaults before creating client
+    char *persisted = NULL;
+    if (json_load_file("/tmp/modbus_config.json", &persisted)) {
+        MqttClientSettings mset = {0};
+        if (config_mqtt_settings_from_json(persisted, &mset)) {
+            if (mset.host[0] && mset.port > 0) {
+                snprintf(g_mqtt_uri, sizeof(g_mqtt_uri), "tcp://%s:%d", mset.host, mset.port);
+            }
+            if (mset.client_id[0]) {
+                snprintf(g_mqtt_clientid, sizeof(g_mqtt_clientid), "%s", mset.client_id);
+            }
+        }
+        free(persisted);
+    }
+
+    rc = MQTTAsync_create(&client, g_mqtt_uri, g_mqtt_clientid,
         MQTTCLIENT_PERSISTENCE_NONE, NULL);
     if (rc != MQTTASYNC_SUCCESS) {
         printf("Failed to create client: %d\n", rc);
