@@ -48,7 +48,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "failed to load serial (%d)\n", rc);
 		return EXIT_FAILURE;
 	}
-
+	printf("serial number:%s\n", serial);
 	memset(&cfg, 0, sizeof(cfg));
 	strncpy(cfg.forge_edge_id, serial, sizeof(cfg.forge_edge_id) - 1);
 	strncpy(cfg.data_mode, "processed", sizeof(cfg.data_mode) - 1);
@@ -78,4 +78,3 @@ int main(int argc, char **argv)
 
 	return 0;
 }
-

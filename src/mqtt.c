@@ -26,7 +26,7 @@
 static const struct config *global_cfg;
 static pthread_t mqtt_thread;
 static volatile int mqtt_running;
-
+static volatile int connected = 0;
 static MQTTAsync client;
 
 /* forward */
@@ -38,13 +38,14 @@ static void connlost(void *context, char *cause)
 {
 	(void)context;
 	fprintf(stderr, "[MQTT] connection lost: %s\n", cause ? cause : "unknown");
+	connected = 0;
 	/* Paho will call connectionLost; the client must reconnect by calling
 	 * MQTTAsync_connect again in a real production implementation.
 	 * For simplicity rely on the mqtt thread to attempt reconnects.
 	 */
 }
 
-static int on_send(void *context, MQTTAsync_successData *response)
+static void on_send(void *context, MQTTAsync_successData *response)
 {
 	(void)context;
 	(void)response;
@@ -64,6 +65,14 @@ static void on_connect_failure(void *context, MQTTAsync_failureData *response)
 	(void)context;
 	(void)response;
 	fprintf(stderr, "[MQTT] connect failed\n");
+}
+
+static int message_arrived(void *context, char *topicName, int topicLen, MQTTAsync_message *message)
+{
+    // Just free the message and return 1 to indicate success
+    MQTTAsync_freeMessage(&message);
+    MQTTAsync_free(topicName);
+    return 1;
 }
 
 /*
@@ -126,9 +135,13 @@ static void *mqtt_thread_fn(void *arg)
 	MQTTAsync_SSLOptions ssl_opts = MQTTAsync_SSLOptions_initializer;
 	char *topic = NULL;
 	char *payload = NULL;
-	int connected = 0;
 
-	snprintf(address, sizeof(address), "%s:%d", cfg->mqtt.broker, cfg->mqtt.port);
+	if (strcmp(cfg->mqtt.security_mode, "tls") == 0)
+		snprintf(address, sizeof(address), "ssl://%s:%d", cfg->mqtt.broker, cfg->mqtt.port);
+	else
+		snprintf(address, sizeof(address), "tcp://%s:%d", cfg->mqtt.broker, cfg->mqtt.port);
+
+	printf("uri:%s\n", address);
 
 	rc = MQTTAsync_create(&client, address, cfg->mqtt.client_id,
 			      MQTTCLIENT_PERSISTENCE_NONE, NULL);
@@ -137,11 +150,16 @@ static void *mqtt_thread_fn(void *arg)
 		mqtt_running = 0;
 		return NULL;
 	}
+	fprintf(stderr, "Connecting to broker '%s' on port %d with client ID '%s'\n",
+        cfg->mqtt.broker, cfg->mqtt.port, cfg->mqtt.client_id);
 
-	MQTTAsync_setCallbacks(client, NULL, connlost, NULL, NULL);
+	MQTTAsync_setCallbacks(client, NULL, connlost, message_arrived, NULL);
 
-	/* build connect options */
-	build_connect_options(&conn_opts, &ssl_opts, &cfg->mqtt);
+	conn_opts.keepAliveInterval = 60;
+	conn_opts.cleansession = 1;
+	conn_opts.onSuccess = on_connect_success;
+	conn_opts.onFailure = on_connect_failure;
+	conn_opts.context = client;
 
 	/* attempt connect with retries */
 	while (mqtt_running) {
