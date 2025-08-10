@@ -16,7 +16,8 @@ set(SOURCES
 	src/json.c
 	src/mqtt.c
 	src/config.c
-	src/modbus.c
+	src/modbus_if.c
+	src/dataq.c
 )
 
 add_executable(modbus_client_BB ${SOURCES})

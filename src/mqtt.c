@@ -1,231 +1,221 @@
-#include "MQTTAsync.h"
+/*
+ * mqtt.c 
+ *
+ * Notes:
+ *  - This code expects Paho Async API (MQTTAsync_*) headers available.
+ *  - TLS is supported via MQTTAsync_SSLOptions when security_mode == "tls".
+ *  - Paho has internal persistence/queueing if configured; here we enqueue
+ *    strings in userspace and call MQTTAsync_sendMessage.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <pthread.h>
-#include <unistd.h>   // for sleep()
-#include "mqtt.h"
-#include "config.h"
-#include "modbus.h"
-#include "json.h"
 
-#define MQTT_ADDRESS     "tcp://test.mosquitto.org:1883"
-#define MQTT_CLIENTID    "modbus_client_BB"
-#define MQTT_TOPIC       "modbus/test"
-#define MQTT_CONFIG_TOPIC "modbus/config"
-#define MQTT_QOS         1
-#define MQTT_TIMEOUT     10000L
+#include "mqtt.h"
+#include "dataq.h"
+#include "config.h"
+
+#include "MQTTAsync.h" /* paho async header; adjust include path as needed */
+
+#define Q_CAPACITY 1024
+#define CLIENT_KEEPALIVE 60
+
+static const struct config *global_cfg;
+static pthread_t mqtt_thread;
+static volatile int mqtt_running;
 
 static MQTTAsync client;
-static char g_mqtt_uri[256] = MQTT_ADDRESS;
-static char g_mqtt_clientid[128] = MQTT_CLIENTID;
-static volatile int client_ready = 0;  // flag to mark connection status
 
-static void publish_adapter(const char *topic, const char *payload) {
-    mqtt_publish(topic, payload);
+/* forward */
+static void *mqtt_thread_fn(void *arg);
+
+/* simple callback functions */
+
+static void connlost(void *context, char *cause)
+{
+	(void)context;
+	fprintf(stderr, "[MQTT] connection lost: %s\n", cause ? cause : "unknown");
+	/* Paho will call connectionLost; the client must reconnect by calling
+	 * MQTTAsync_connect again in a real production implementation.
+	 * For simplicity rely on the mqtt thread to attempt reconnects.
+	 */
 }
 
-// Forward declarations for callbacks referenced before definition
-void onDeliveryComplete(void *context, MQTTAsync_token token);
-void onConnectSuccess(void *context, MQTTAsync_successData *response);
-void onConnectFailure(void *context, MQTTAsync_failureData *response);
-
-// Connection lost callback
-void connlost(void *context, char *cause) {
-    printf("Connection lost. Cause: %s\n", cause);
-    client_ready = 0;
-    // Try reconnecting
-    MQTTAsync_connectOptions conn_opts = MQTTAsync_connectOptions_initializer;
-    conn_opts.keepAliveInterval = 20;
-    conn_opts.cleansession = 1;
-    conn_opts.onSuccess = NULL;
-    conn_opts.onFailure = NULL;
-    conn_opts.context = client;
-
-    int rc = MQTTAsync_connect(client, &conn_opts);
-    if (rc != MQTTASYNC_SUCCESS) {
-        printf("Failed to start reconnect, return code %d\n", rc);
-    } else {
-        printf("Reconnecting...\n");
-    }
+static int on_send(void *context, MQTTAsync_successData *response)
+{
+	(void)context;
+	(void)response;
+	/* delivery acknowledged */
+	return 1;
 }
 
-// Message arrived callback
-int msgarrvd(void *context, char *topicName, int topicLen, MQTTAsync_message *message) {
-    printf("Message arrived on topic: %s\n", topicName);
-    printf("Payload: %.*s\n", message->payloadlen, (char *)message->payload);
-
-    if (strcmp(topicName, MQTT_CONFIG_TOPIC) == 0) {
-        // Parse config and (re)start worker
-        ModbusConfig cfg;
-        MqttClientSettings mset;
-        char *tmp = (char*)malloc((size_t)message->payloadlen + 1);
-        if (tmp) {
-            memcpy(tmp, message->payload, (size_t)message->payloadlen);
-            tmp[message->payloadlen] = '\0';
-            // Persist raw JSON to disk for reset-proof behavior
-            (void)json_save_to_file("/tmp/modbus_config.json", tmp);
-            // Update MQTT settings if provided
-            if (config_mqtt_settings_from_json(tmp, &mset)) {
-                if (mset.host[0] && mset.port > 0) {
-                    snprintf(g_mqtt_uri, sizeof(g_mqtt_uri), "tcp://%s:%d", mset.host, mset.port);
-                }
-                if (mset.client_id[0]) {
-                    snprintf(g_mqtt_clientid, sizeof(g_mqtt_clientid), "%s", mset.client_id);
-                }
-                // Recreate client with new settings
-                MQTTAsync_destroy(&client);
-                if (MQTTAsync_create(&client, g_mqtt_uri, g_mqtt_clientid, MQTTCLIENT_PERSISTENCE_NONE, NULL) == MQTTASYNC_SUCCESS) {
-                    MQTTAsync_setCallbacks(client, NULL, connlost, msgarrvd, onDeliveryComplete);
-                    MQTTAsync_connectOptions conn_opts = MQTTAsync_connectOptions_initializer;
-                    conn_opts.keepAliveInterval = 20;
-                    conn_opts.cleansession = 1;
-                    conn_opts.onSuccess = onConnectSuccess;
-                    conn_opts.onFailure = onConnectFailure;
-                    conn_opts.context = client;
-                    MQTTAsync_connect(client, &conn_opts);
-                    printf("MQTT settings updated. Reconnecting to %s with clientId %s.\n", g_mqtt_uri, g_mqtt_clientid);
-                }
-            }
-            if (config_update_from_json(tmp, &cfg)) {
-                if (modbus_worker_is_running()) modbus_worker_stop();
-                if (!cfg.publish_topic[0]) snprintf(cfg.publish_topic, sizeof(cfg.publish_topic), "%s", MQTT_TOPIC);
-                modbus_worker_start(&cfg, publish_adapter);
-                printf("Config applied and worker started.\n");
-            } else {
-                printf("Invalid config JSON.\n");
-            }
-            free(tmp);
-        }
-    }
-
-    MQTTAsync_freeMessage(&message);
-    MQTTAsync_free(topicName);
-    return 1;
+static void on_connect_success(void *context, MQTTAsync_successData *response)
+{
+	(void)context;
+	(void)response;
+	fprintf(stderr, "[MQTT] connected (on_connect_success)\n");
 }
 
-// Delivery complete callback
-void onDeliveryComplete(void *context, MQTTAsync_token token) {
-    printf("Delivery complete for token: %d\n", token);
+static void on_connect_failure(void *context, MQTTAsync_failureData *response)
+{
+	(void)context;
+	(void)response;
+	fprintf(stderr, "[MQTT] connect failed\n");
 }
 
-// Connection success callback
-void onConnectSuccess(void *context, MQTTAsync_successData *response) {
-    printf("Successfully connected to MQTT broker.\n");
-    client_ready = 1;
+/*
+ * build_connect_options - prepare MQTTAsync_connectOptions with TLS if needed.
+ */
+static int build_connect_options(MQTTAsync_connectOptions *conn_opts,
+				 MQTTAsync_SSLOptions *ssl_opts,
+				 const struct mqtt_config *mcfg)
+{
+	memset(conn_opts, 0, sizeof(*conn_opts));
+	conn_opts->keepAliveInterval = CLIENT_KEEPALIVE;
+	conn_opts->cleansession = 1;
+	conn_opts->onSuccess = on_connect_success;
+	conn_opts->onFailure = on_connect_failure;
+	conn_opts->context = NULL;
 
-    // Subscribe to topic
-    int rc = MQTTAsync_subscribe(client, MQTT_TOPIC, MQTT_QOS, NULL);
-    if (rc != MQTTASYNC_SUCCESS) {
-        printf("Failed to subscribe, return code %d\n", rc);
-    }
+	if (mcfg->enabled && strcmp(mcfg->security_mode, "tls") == 0) {
+		memset(ssl_opts, 0, sizeof(*ssl_opts));
+		ssl_opts->trustStore = mcfg->tls.ca_cert[0] ? mcfg->tls.ca_cert : NULL;
+		ssl_opts->keyStore = mcfg->tls.client_cert[0] ? mcfg->tls.client_cert : NULL;
+		ssl_opts->privateKey = mcfg->tls.client_key[0] ? mcfg->tls.client_key : NULL;
+		ssl_opts->enableServerCertAuth = mcfg->tls.verify_peer ? 1 : 0;
+		conn_opts->ssl = ssl_opts;
+	} else {
+		conn_opts->ssl = NULL;
+	}
 
-    // Subscribe to config topic
-    rc = MQTTAsync_subscribe(client, MQTT_CONFIG_TOPIC, MQTT_QOS, NULL);
-    if (rc != MQTTASYNC_SUCCESS) {
-        printf("Failed to subscribe to config, return code %d\n", rc);
-    }
+	return 0;
 }
 
-// Connection failure callback
-void onConnectFailure(void *context, MQTTAsync_failureData *response) {
-    printf("Connection to MQTT broker failed.\n");
-    client_ready = 0;
+static int mqtt_publish_msg(const char *topic, const char *payload)
+{
+	MQTTAsync_message pubmsg = MQTTAsync_message_initializer;
+	MQTTAsync_responseOptions opts = MQTTAsync_responseOptions_initializer;
+	int rc;
+
+	pubmsg.payload = (void *)payload;
+	pubmsg.payloadlen = (int)strlen(payload);
+	pubmsg.qos = 1;
+	pubmsg.retained = 0;
+
+	opts.onSuccess = on_send;
+	opts.onFailure = NULL;
+	opts.context = NULL;
+
+	rc = MQTTAsync_sendMessage(client, topic, &pubmsg, &opts);
+	if (rc != MQTTASYNC_SUCCESS) {
+		fprintf(stderr, "[MQTT] sendMessage failed: %d\n", rc);
+		return -1;
+	}
+	return 0;
 }
 
-void *mqtt_thread_func(void *arg) {
-    int rc;
+static void *mqtt_thread_fn(void *arg)
+{
+	const struct config *cfg = (const struct config *)arg;
+	char address[256];
+	int rc;
+	MQTTAsync_connectOptions conn_opts = MQTTAsync_connectOptions_initializer;
+	MQTTAsync_SSLOptions ssl_opts = MQTTAsync_SSLOptions_initializer;
+	char *topic = NULL;
+	char *payload = NULL;
+	int connected = 0;
 
-    printf("Thread started\n");
+	snprintf(address, sizeof(address), "%s:%d", cfg->mqtt.broker, cfg->mqtt.port);
 
-    // Try to load persisted config to override defaults before creating client
-    char *persisted = NULL;
-    if (json_load_file("/tmp/modbus_config.json", &persisted)) {
-        MqttClientSettings mset = {0};
-        if (config_mqtt_settings_from_json(persisted, &mset)) {
-            if (mset.host[0] && mset.port > 0) {
-                snprintf(g_mqtt_uri, sizeof(g_mqtt_uri), "tcp://%s:%d", mset.host, mset.port);
-            }
-            if (mset.client_id[0]) {
-                snprintf(g_mqtt_clientid, sizeof(g_mqtt_clientid), "%s", mset.client_id);
-            }
-        }
-        free(persisted);
-    }
+	rc = MQTTAsync_create(&client, address, cfg->mqtt.client_id,
+			      MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	if (rc != MQTTASYNC_SUCCESS) {
+		fprintf(stderr, "[MQTT] MQTTAsync_create failed: %d\n", rc);
+		mqtt_running = 0;
+		return NULL;
+	}
 
-    rc = MQTTAsync_create(&client, g_mqtt_uri, g_mqtt_clientid,
-        MQTTCLIENT_PERSISTENCE_NONE, NULL);
-    if (rc != MQTTASYNC_SUCCESS) {
-        printf("Failed to create client: %d\n", rc);
-        return NULL;
-    }
+	MQTTAsync_setCallbacks(client, NULL, connlost, NULL, NULL);
 
-    printf("MQTT client created\n");
+	/* build connect options */
+	build_connect_options(&conn_opts, &ssl_opts, &cfg->mqtt);
 
-    MQTTAsync_setCallbacks(client, NULL, connlost, msgarrvd, onDeliveryComplete);
+	/* attempt connect with retries */
+	while (mqtt_running) {
+		if (!connected) {
+			rc = MQTTAsync_connect(client, &conn_opts);
+			if (rc == MQTTASYNC_SUCCESS) {
+				connected = 1;
+				fprintf(stderr, "[MQTT] connect in progress\n");
+				/* wait briefly for onSuccess callback or assume connected */
+				sleep(1);
+			} else {
+				fprintf(stderr, "[MQTT] connect failed rc=%d, retrying in 2s\n", rc);
+				sleep(2);
+				continue;
+			}
+		}
 
-    printf("Callbacks set\n");
+		/* publish any queued messages */
+		if (data_queue_dequeue(&topic, &payload) == 0) {
+			if (topic && payload) {
+				mqtt_publish_msg(topic, payload);
+				free(topic);
+				free(payload);
+			}
+		} else {
+			/* queue stopped or interrupted; wait briefly */
+			sleep(1);
+		}
+	}
 
-    MQTTAsync_connectOptions conn_opts = MQTTAsync_connectOptions_initializer;
-    conn_opts.keepAliveInterval = 20;
-    conn_opts.cleansession = 1;
-    conn_opts.onSuccess = onConnectSuccess;
-    conn_opts.onFailure = onConnectFailure;
-    conn_opts.context = client;
+	/* disconnect cleanly */
+	if (connected) {
+		MQTTAsync_disconnectOptions disc_opts = MQTTAsync_disconnectOptions_initializer;
+		MQTTAsync_disconnect(client, &disc_opts);
+	}
 
-    rc = MQTTAsync_connect(client, &conn_opts);
-    if (rc != MQTTASYNC_SUCCESS) {
-        printf("Failed to start connect: %d\n", rc);
-        return NULL;
-    }
-
-    printf("Connecting...\n");
-
-    // Keep thread alive to handle async events
-    while (1) {
-        sleep(1);
-    }
-
-    return NULL;
+	MQTTAsync_destroy(&client);
+	return NULL;
 }
 
-void mqtt_start() {
-    pthread_t mqtt_thread;
-    printf("Creating MQTT thread\n");
-    int err = pthread_create(&mqtt_thread, NULL, mqtt_thread_func, NULL);
-    if (err) {
-        printf("Failed to create MQTT thread: %d\n", err);
-        return;
-    }
-    printf("Detaching MQTT thread\n");
-    pthread_detach(mqtt_thread);
-    printf("mqtt_start() completed\n");
+int mqtt_start(const struct config *cfg)
+{
+	int rc;
+
+	if (!cfg)
+		return -1;
+
+	/* init queue */
+	rc = data_queue_init(Q_CAPACITY);
+	if (rc)
+		return -1;
+
+	global_cfg = cfg;
+	mqtt_running = 1;
+
+	rc = pthread_create(&mqtt_thread, NULL, mqtt_thread_fn, (void *)cfg);
+	if (rc) {
+		mqtt_running = 0;
+		data_queue_destroy();
+		return -1;
+	}
+	return 0;
 }
 
-void mqtt_publish(const char *topic, const char *payload) {
-    if (!client_ready) {
-        printf("MQTT client not ready yet. Skipping publish.\n");
-        return;
-    }
+void mqtt_stop(void)
+{
+	mqtt_running = 0;
+	data_queue_stop();
+	pthread_join(mqtt_thread, NULL);
+	data_queue_destroy();
+}
 
-    if (client == NULL) {
-        printf("MQTT client handle is NULL. Skipping publish.\n");
-        return;
-    }
-
-    MQTTAsync_message pubmsg = MQTTAsync_message_initializer;
-    MQTTAsync_responseOptions opts = MQTTAsync_responseOptions_initializer;
-
-    pubmsg.payload = (void *)payload;
-    pubmsg.payloadlen = strlen(payload);
-    pubmsg.qos = MQTT_QOS;
-    pubmsg.retained = 0;
-
-    int rc;
-    if ((rc = MQTTAsync_sendMessage(client, topic, &pubmsg, &opts)) != MQTTASYNC_SUCCESS) {
-        printf("Failed to publish message, return code: %d\n", rc);
-    } else {
-        printf("Message published to topic %s\n", topic);
-    }
+int mqtt_publish(const char *topic, const char *payload)
+{
+	return data_queue_enqueue(topic, payload);
 }
 

@@ -2,53 +2,62 @@
 #define CONFIG_H
 
 #include <stdbool.h>
-#include <stdint.h>
+#include <stddef.h>
 
-// Modbus function types supported
-typedef enum ModbusFunctionType {
-  MODBUS_FUNC_COILS = 1,              // modbus_read_bits
-  MODBUS_FUNC_DISCRETE_INPUTS = 2,    // modbus_read_input_bits
-  MODBUS_FUNC_HOLDING_REGISTERS = 3,  // modbus_read_registers
-  MODBUS_FUNC_INPUT_REGISTERS = 4     // modbus_read_input_registers
-} ModbusFunctionType;
+#define MAX_IO_DEVICES	5u
+#define MAX_PARAMETERS	32u
+#define MAX_STR_LEN	128u
 
-typedef struct ModbusReadPlan {
-  ModbusFunctionType function;
-  int address;
-  int count;
-  char name[64];
-} ModbusReadPlan;
+#define DEFAULT_CONFIG_PATH	"/etc/forgeedge/config.json"
+#define SERIAL_FILE_PATH	"/etc/forgeedge/serial.txt"
 
-typedef struct ModbusTcpConfig {
-  char host[128];
-  int port;
-} ModbusTcpConfig;
+struct parameter {
+	char name[MAX_STR_LEN];
+	char type[16];		/* \"coil\", \"holding\", \"input\" */
+	int address;
+	int count;
+	double scale;
+};
 
-typedef struct ModbusConfig {
-  int slave_id;
-  uint32_t poll_interval_ms;
-  uint32_t publish_interval_ms; // independent telemetry publish interval (optional)
-  char publish_topic[128];
-  // Reads
-  ModbusReadPlan reads[16];
-  int num_reads;
+struct io_device {
+	char io_device_id[MAX_STR_LEN];
+	char ip[MAX_STR_LEN];
+	int port;
+	int unit_id;
+	int poll_interval_ms;
+	int parameter_count;
+	struct parameter parameters[MAX_PARAMETERS];
+};
 
-  // Connection-specific
-  ModbusTcpConfig tcp;
-} ModbusConfig;
+struct tls_config {
+	char ca_cert[MAX_STR_LEN];
+	char client_cert[MAX_STR_LEN];
+	char client_key[MAX_STR_LEN];
+	int verify_peer;
+};
 
-// Global configuration state
-bool config_update_from_json(const char *json_text, ModbusConfig *out_config);
+struct mqtt_config {
+	int enabled;
+	char security_mode[16];	/* \"none\" or \"tls\" */
+	char broker[MAX_STR_LEN];
+	int port;
+	char client_id[MAX_STR_LEN];
+	char username[MAX_STR_LEN];
+	char password[MAX_STR_LEN];
+	struct tls_config tls;
+};
 
-// MQTT client parameters from JSON config
-typedef struct MqttClientSettings {
-  char host[128];
-  int port;
-  char client_id[128];
-} MqttClientSettings;
+struct config {
+	char forge_edge_id[MAX_STR_LEN];
+	char data_mode[16];	/* \"processed\" or \"raw\" */
+	struct mqtt_config mqtt;
+	int io_device_count;
+	struct io_device io_devices[MAX_IO_DEVICES];
+};
 
-bool config_mqtt_settings_from_json(const char *json_text, MqttClientSettings *out);
+int load_config_from_file(const char *path, struct config *cfg);
+int save_config_to_file(const char *path, const struct config *cfg);
+int load_serial(char *buf, size_t len);
 
-#endif // CONFIG_H
-
+#endif /* CONFIG_H */
 
