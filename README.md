@@ -36,3 +36,47 @@ Config JSON example to publish on `modbus/config` (includes MQTT settings and TC
 Published telemetry format per read plan:
 `{"name":"hr0","ts":1690000000,"data":[12,34,56,78]}`
 
+
+configuration send over mqtt using "forgeedge/config/serial" number as topic:
+```
+{
+    "forge_edge_id": "FE-001",
+    "data_mode": "processed",          // "processed" or "raw"
+    "mqtt": {
+      "enabled": true,
+      "security_mode": "tls",          // "none" or "tls"
+      "broker": "192.168.1.100",
+      "port": 8883,
+      "client_id": "FE-001-client",
+      "username": "forgeedge",
+      "password": "forgeedge",
+      "tls_config": {
+        "ca_cert": "/etc/forgeedge/ca.crt",
+        "client_cert": "/etc/forgeedge/client.crt",
+        "client_key": "/etc/forgeedge/client.key",
+        "verify_peer": true             // true = validate broker certificate
+      }
+    },
+    "io_devices": [
+      {
+        "io_device_id": "IO-01",
+        "ip": "192.168.1.10",
+        "port": 502,
+        "poll_interval_ms": 1000,
+        "parameters": [
+          { "name": "die-temperature", "type": "holding", "address": 0, "count": 1 },
+          { "name": "pressure", "type": "coil", "address": 10, "count": 1 }
+        ]
+      },
+      {
+        "io_device_id": "IO-02",
+        "ip": "192.168.1.11",
+        "port": 502,
+        "poll_interval_ms": 2000,
+        "parameters": [
+          { "name": "pump-status", "type": "coil", "address": 20, "count": 1 }
+        ]
+      }
+    ]
+  }
+```
